@@ -2,8 +2,7 @@
   Base-tag ancestry outer host. In its End mode it invokes basetag_probe from
   THIS template — that is how real tag libraries nest (a modal tag rendering
   its fragment/slot children). Tags placed in this host's BODY also see it as
-  an ancestor when it is cf_-invoked (pinned separately in the test; a
-  cfmodule-invoked host would not appear there).
+  an ancestor, however it is invoked (pinned separately in the test).
 
   After the probe runs, reports (via request.btouter) whether the slot the
   probe deposited into attributes through the getBaseTagData() reference is

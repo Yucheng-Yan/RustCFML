@@ -4411,18 +4411,21 @@ pub(crate) struct TryHandler {
 /// `tests/tags/test_getbasetag_functions.cfm`).
 #[derive(Clone)]
 struct BaseTagEntry {
-    /// Uppercased ancestry name: `CF_MYTAG` for a `<cf_mytag>` invocation,
-    /// `CFMODULE` for a `<cfmodule>`/`module` one.
+    /// The name `getBaseTagList()` reports: `CF_MYTAG` for a `<cf_mytag>` or a
+    /// cfimport-prefixed `<p:mytag>` invocation, `CFMODULE` for a
+    /// `<cfmodule>`/`module` one (Lucee-measured).
     name: String,
+    /// The name `getBaseTagData()` matches, lowercased and without the `cf_`
+    /// prefix: the tag name for `cf_`/prefix invocations, the template's file
+    /// name for `cfmodule` ones. Lucee finds a module-invoked tag by
+    /// `getBaseTagData("cf_<file>")` even though it lists it as CFMODULE, and
+    /// never by "CFMODULE" itself.
+    lookup: String,
     /// The tag's live Arc-backed `variables` scope — what `getBaseTagData()`
     /// hands back. Sharing the Arc (rather than snapshotting) is the whole
     /// point: the fragment/slot pattern DEPOSITS into an ancestor's
     /// `attributes` through this reference and the ancestor must see it.
     tag_vars: CfmlStruct,
-    /// Whether `getBaseTagData(name)` can find this entry. False for
-    /// `cfmodule` invocations: Lucee lists them as `CFMODULE` but cannot look
-    /// them up by that name ("can't find base tag with name [CFMODULE]").
-    findable: bool,
 }
 
 /// State for a body-mode custom tag execution
@@ -22735,11 +22738,22 @@ impl CfmlVirtualMachine {
                         .and_then(|v| v.as_string().trim().parse::<usize>().ok())
                         .unwrap_or(1)
                         .max(1);
+                    // Matched against each entry's lookup name, with or without
+                    // the `cf_` prefix: getBaseTagData("cf_mytag") and
+                    // getBaseTagData("mytag") both find <cf_mytag> (Lucee-
+                    // measured). "CFMODULE" matches nothing, because a module
+                    // entry's lookup name is its template's file name. The name
+                    // is not trimmed ("cf_mytag " finds nothing, as on Lucee),
+                    // and case is folded the same way the lookup names were, so
+                    // a non-ASCII name matches in any case.
+                    let key = match want.get(..3) {
+                        Some(p) if p.eq_ignore_ascii_case("cf_") => &want[3..],
+                        _ => want.as_str(),
+                    }
+                    .to_lowercase();
                     let mut seen = 0usize;
                     for entry in self.base_tag_stack.iter().rev() {
-                        // cfmodule entries are listed but not findable — Lucee
-                        // raises the same "can't find" error for them.
-                        if !entry.findable || !entry.name.eq_ignore_ascii_case(&want) {
+                        if key.is_empty() || entry.lookup != key {
                             continue;
                         }
                         seen += 1;
@@ -22821,17 +22835,23 @@ impl CfmlVirtualMachine {
 
                     // Ancestry entry for this tag, live for BOTH phases so the
                     // tag's own template sees itself as element 1. `__cfmodule`
-                    // never carries a `__cf_:` spec, so it lands as CFMODULE.
+                    // is always a module invocation; a cfimport-prefixed tag
+                    // passes its name as the fourth argument.
                     let base_depth = self.base_tag_stack.len();
-                    let (bt_name, bt_findable) = if name_lower == "__cfmodule" {
-                        ("CFMODULE".to_string(), false)
+                    let import_tag = if name_lower == "__cfmodule" {
+                        None
                     } else {
-                        Self::base_tag_identity(&path_spec)
+                        args.get(3).map(|v| v.as_string())
+                    };
+                    let (bt_name, bt_lookup) = if name_lower == "__cfmodule" {
+                        ("CFMODULE".to_string(), Self::base_tag_file_name(&resolved))
+                    } else {
+                        Self::base_tag_identity(&path_spec, &resolved, import_tag.as_deref())
                     };
                     self.base_tag_stack.push(BaseTagEntry {
                         name: bt_name,
+                        lookup: bt_lookup,
                         tag_vars: tag_vars.clone(),
-                        findable: bt_findable,
                     });
 
                     self.tag_phase_stack.push(false);
@@ -22938,11 +22958,14 @@ impl CfmlVirtualMachine {
                     // must see the host as its element 2 (Lucee-measured).
                     // `__cfcustomtag_end` pops it.
                     let base_depth = self.base_tag_stack.len();
-                    let (bt_name, bt_findable) = Self::base_tag_identity(&path_spec);
+                    // A cfimport-prefixed tag passes its name as the third argument.
+                    let import_tag = args.get(2).map(|v| v.as_string());
+                    let (bt_name, bt_lookup) =
+                        Self::base_tag_identity(&path_spec, &resolved, import_tag.as_deref());
                     self.base_tag_stack.push(BaseTagEntry {
                         name: bt_name,
+                        lookup: bt_lookup,
                         tag_vars: tag_vars.clone(),
-                        findable: bt_findable,
                     });
 
                     self.tag_phase_stack.push(false);
@@ -32252,20 +32275,37 @@ impl CfmlVirtualMachine {
         (String::new(), CfmlValue::strukt(map))
     }
 
-    /// Ancestry name for a custom-tag invocation, plus whether
-    /// `getBaseTagData(name)` may find it.
+    /// Ancestry identity for a custom-tag invocation: the name
+    /// `getBaseTagList()` reports and the name `getBaseTagData()` matches
+    /// (see `BaseTagEntry`). Lucee-measured on 7.0.4.34 and 5.3.10:
     ///
-    /// `<cf_mytag>` lowers to the `__cf_:mytag` spec and is listed (and found)
-    /// as `CF_MYTAG`. Everything else reached this way is a `cfmodule`
-    /// invocation, which Lucee lists as `CFMODULE` but refuses to look up by
-    /// name — so it is pushed unfindable rather than omitted, because it must
-    /// still occupy a position in `getBaseTagList()`.
-    fn base_tag_identity(path_spec: &str) -> (String, bool) {
-        if let Some(tag) = path_spec.strip_prefix("__cf_:") {
-            (format!("CF_{}", tag.to_uppercase()), true)
+    /// - `<cf_mytag>` (the `__cf_:mytag` spec) is listed and found as CF_MYTAG;
+    /// - a cfimport-prefixed `<p:mytag>` (`import_tag` = "mytag") is listed and
+    ///   found as CF_MYTAG too — the prefix is not part of the name;
+    /// - anything else is a `<cfmodule>` invocation: listed as CFMODULE, and
+    ///   found only by the template's file name (`cf_<file>`), never by
+    ///   "CFMODULE".
+    fn base_tag_identity(
+        path_spec: &str,
+        resolved: &str,
+        import_tag: Option<&str>,
+    ) -> (String, String) {
+        if let Some(tag) = import_tag.filter(|t| !t.is_empty()) {
+            (format!("CF_{}", tag.to_uppercase()), tag.to_lowercase())
+        } else if let Some(tag) = path_spec.strip_prefix("__cf_:") {
+            (format!("CF_{}", tag.to_uppercase()), tag.to_lowercase())
         } else {
-            ("CFMODULE".to_string(), false)
+            ("CFMODULE".to_string(), Self::base_tag_file_name(resolved))
         }
+    }
+
+    /// A module-invoked tag's lookup name: its template's file name without the
+    /// extension, lowercased.
+    fn base_tag_file_name(resolved: &str) -> String {
+        std::path::Path::new(resolved)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
     }
 
     /// Resolve a custom tag path specification to an actual filesystem path.

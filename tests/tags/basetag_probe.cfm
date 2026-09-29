@@ -10,6 +10,8 @@
     deposit — a slot name to write into the nearest ancestor's attributes
               through the getBaseTagData() reference (the fragment/slot
               pattern real custom-tag libraries use)
+    lookup  — a name to pass to getBaseTagData(); the found tag's
+              attributes.marker is reported as lookup_marker
 --->
 <cfif thisTag.executionMode eq "start">
 
@@ -42,6 +44,18 @@
         <cfset dummy = getBaseTagData("CFMODULE") />
         <cfcatch type="any"><cfset p.cfmodule_lookup = "(threw: #cfcatch.message#)" /></cfcatch>
     </cftry>
+
+    <!--- Lookup by an explicit name (e.g. a module host's file name, or a tag
+          name without its cf_ prefix). The lookup is its own statement: on
+          Lucee 7 an Elvis operator swallows an exception in its left operand,
+          so a failed lookup inside one would never reach the catch. --->
+    <cfif structKeyExists(attributes, "lookup")>
+        <cftry>
+            <cfset lookupData = getBaseTagData(attributes.lookup) />
+            <cfset p.lookup_marker = lookupData.attributes.marker ?: "(no-marker)" />
+            <cfcatch type="any"><cfset p.lookup_marker = "(threw: #cfcatch.message#)" /></cfcatch>
+        </cftry>
+    </cfif>
 
     <!--- The deposit shape: mutate the ancestor's attributes through the
           returned reference; the ancestor checks for it after the probe

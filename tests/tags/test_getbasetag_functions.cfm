@@ -16,10 +16,12 @@
 // webroot, suite via tests/runner.cfm). Two measured subtleties pinned here
 // so an implementation gets them right:
 //   - a cf_-invoked host IS in the ancestry of tags placed in its body
-//     (leg D) — but a cfmodule-invoked host is NOT (its body runs in the
-//     caller's context with no CFMODULE ancestor added);
+//     (leg D), and so is a cfimport-prefixed or a cfmodule-invoked host
+//     (legs G and H);
 //   - cfmodule-invoked tags appear in getBaseTagList() as CFMODULE but
-//     getBaseTagData("CFMODULE") cannot find them (leg E).
+//     getBaseTagData("CFMODULE") cannot find them (leg E); they are found by
+//     their template's file name instead (leg H).
+// Legs F-I were measured on Lucee 7.0.4.34 and Lucee 5.3.10, which agree.
 
 suiteBegin("getBaseTagList()/getBaseTagData(): custom-tag ancestry built-ins");
 
@@ -80,8 +82,7 @@ assert(
 
 <!--- ── D: body placement (Lucee-measured): a tag invoked in a cf_ host's
        BODY sees the host in its ancestry — element 2 is the host, and its
-       attributes are readable there. (Contrast: a cfmodule-invoked host does
-       NOT appear in its body tags' ancestry.) --->
+       attributes are readable there. --->
 <cfset structDelete(request, "btbody") />
 <cfset request.bt_body_err = "" />
 <cftry>
@@ -100,7 +101,8 @@ assert( "D: the body tag reads the host's attributes via getBaseTagData",
 <!--- ── E: cfmodule limitation (Lucee-measured): a module-invoked tag appears
        in getBaseTagList() as CFMODULE, but getBaseTagData("CFMODULE") throws
        ("can't find base tag with name [CFMODULE]") — module entries are not
-       findable by name. --->
+       findable by the name they are listed under (leg H: they are found by
+       their template's file name). --->
 <cfset structDelete(request, "btmod") />
 <cfset request.bt_mod_err = "" />
 <cftry>
@@ -115,6 +117,97 @@ assert( "E: module-invoked tag's own getBaseTagList() entry is CFMODULE", modPro
 assertTrue( "E: getBaseTagData('CFMODULE') cannot find module entries (saw: " & ( modProbe.cfmodule_lookup ?: "(missing)" ) & ")",
     findNoCase( "(threw:", modProbe.cfmodule_lookup ?: "" ) GT 0 );
 
+// (legs F-I follow in tag syntax; cleanup is at the end)
+</cfscript>
+
+<!--- ── F: a cfimport-prefixed tag has the same identity as its cf_ form:
+       it is listed as CF_<NAME> (the prefix is not part of the name, and the
+       name is uppercased however it is written) and found by that name. --->
+<cfimport taglib="." prefix="btl">
+<cfset structDelete(request, "btimp") />
+<cfset structDelete(request, "btimpcase") />
+<cfset request.bt_imp_err = "" />
+<cftry>
+    <btl:basetag_probe marker="imp-1" report="btimp" />
+    <btl:BaseTag_Probe marker="imp-case" report="btimpcase" />
+    <cfcatch type="any"><cfset request.bt_imp_err = "THREW: " & cfcatch.message /></cfcatch>
+</cftry>
+
+<cfscript>
+assert( "F: cfimport-prefixed probe completes", request.bt_imp_err EQ "" ? "ok" : request.bt_imp_err, "ok" );
+impProbe = request.btimp ?: {};
+assert( "F: a prefixed tag's own entry is CF_<NAME>, not CFMODULE", impProbe.first ?: "(missing)", "CF_BASETAG_PROBE" );
+assert( "F: element 2 is still the suite runner", impProbe.parent_name ?: "(missing)", "CF_RUNTEST" );
+assert( "F: a prefixed tag is found by CF_<NAME>", impProbe.self_marker ?: "(missing)", "imp-1" );
+impCase = request.btimpcase ?: {};
+assert( "F: the name is uppercased however it is written", impCase.first ?: "(missing)", "CF_BASETAG_PROBE" );
+</cfscript>
+
+<!--- ── G: a cfimport-prefixed host is in its body tags' ancestry, and a
+       body tag reads the host's attributes through getBaseTagData(). --->
+<cfset structDelete(request, "btimpbody") />
+<cfset request.bt_impbody_err = "" />
+<cftry>
+    <btl:basetag_outer marker="imp-outer"><btl:basetag_probe marker="imp-body" report="btimpbody" /></btl:basetag_outer>
+    <cfcatch type="any"><cfset request.bt_impbody_err = "THREW: " & cfcatch.message /></cfcatch>
+</cftry>
+
+<cfscript>
+assert( "G: prefixed host with a prefixed body tag completes", request.bt_impbody_err EQ "" ? "ok" : request.bt_impbody_err, "ok" );
+impBody = request.btimpbody ?: {};
+assert( "G: element 2 of the body tag is the prefixed host", impBody.parent_name ?: "(missing)", "CF_BASETAG_OUTER" );
+assert( "G: the body tag reads the host's attributes via getBaseTagData", impBody.parent_marker ?: "(missing)", "imp-outer" );
+</cfscript>
+
+<!--- ── H: a cfmodule-invoked host is in its body tags' ancestry, listed as
+       CFMODULE, and found by its template's file name. --->
+<cfset structDelete(request, "btmodbody") />
+<cfset request.bt_modbody_err = "" />
+<cftry>
+    <cfmodule template="basetag_outer.cfm" marker="mod-outer"><cf_basetag_probe marker="mod-body" report="btmodbody" lookup="cf_basetag_outer" /></cfmodule>
+    <cfcatch type="any"><cfset request.bt_modbody_err = "THREW: " & cfcatch.message /></cfcatch>
+</cftry>
+
+<cfscript>
+assert( "H: cfmodule host with a body tag completes", request.bt_modbody_err EQ "" ? "ok" : request.bt_modbody_err, "ok" );
+modBody = request.btmodbody ?: {};
+assert( "H: element 2 of the body tag is the module host, listed as CFMODULE", modBody.parent_name ?: "(missing)", "CFMODULE" );
+assert( "H: the module host is found by its template's file name", modBody.lookup_marker ?: "(missing)", "mod-outer" );
+assertTrue( "H: but still not by CFMODULE (saw: " & ( modBody.cfmodule_lookup ?: "(missing)" ) & ")",
+    findNoCase( "(threw:", modBody.cfmodule_lookup ?: "" ) GT 0 );
+</cfscript>
+
+<!--- ── I: the cf_ prefix is optional in a lookup: getBaseTagData("mytag")
+       finds <cf_mytag> and <p:mytag> alike. --->
+<cfset structDelete(request, "btbare") />
+<cfset structDelete(request, "btbareimp") />
+<cfset structDelete(request, "btpadded") />
+<cftry>
+    <cf_basetag_probe marker="bare-1" report="btbare" lookup="basetag_probe" />
+    <btl:basetag_probe marker="bare-imp" report="btbareimp" lookup="BaseTag_Probe" />
+    <cf_basetag_probe marker="padded-1" report="btpadded" lookup=" cf_basetag_probe " />
+    <cfcatch type="any"></cfcatch>
+</cftry>
+
+<cfscript>
+bareProbe = request.btbare ?: {};
+bareImp = request.btbareimp ?: {};
+assert( "I: a cf_ tag is found by its name without the cf_ prefix", bareProbe.lookup_marker ?: "(missing)", "bare-1" );
+assert( "I: so is a prefixed tag, in any case", bareImp.lookup_marker ?: "(missing)", "bare-imp" );
+paddedProbe = request.btpadded ?: {};
+assertTrue( "I: the name is not trimmed, so a padded name finds nothing (saw: " & ( paddedProbe.lookup_marker ?: "(missing)" ) & ")",
+    findNoCase( "(threw:", paddedProbe.lookup_marker ?: "" ) GT 0 );
+
+structDelete(request, "btimp");
+structDelete(request, "btimpcase");
+structDelete(request, "btimpbody");
+structDelete(request, "btmodbody");
+structDelete(request, "btbare");
+structDelete(request, "btbareimp");
+structDelete(request, "btpadded");
+structDelete(request, "bt_imp_err");
+structDelete(request, "bt_impbody_err");
+structDelete(request, "bt_modbody_err");
 structDelete(request, "btprobe");
 structDelete(request, "btnested");
 structDelete(request, "btbody");
