@@ -230,6 +230,8 @@ include "harness.cfm";
 <cf_runtest file="types/test_integer_literal_member_access.cfm" />
 <cf_runtest file="comments/test_hash_in_comments.cfm" />
 <cf_runtest file="comments/test_tags_in_block_comments.cfm" />
+<!--- A tag named inside a CFML comment opens, closes and declares nothing. --->
+<cf_runtest file="comments/test_tag_scan_skips_comments.cfm" />
 
 <!--- --- Standard Library --- --->
 <cf_runtest file="stdlib/test_hash_unknown_algorithm.cfm" />

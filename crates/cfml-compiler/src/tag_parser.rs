@@ -381,42 +381,16 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
 
     while i < len {
         // Strip CFML comments: <!--- ... --->
-        if i + 4 < len && chars[i] == '<' && chars[i + 1] == '!' && chars[i + 2] == '-' && chars[i + 3] == '-' && chars[i + 4] == '-' {
-            // Find the closing `--->`. CFML comments NEST (unlike HTML): the
-            // comment `<!--- a <!--- b ---> c --->` is a SINGLE comment. Track
-            // depth so an inner `<!--- … --->` doesn't terminate the outer one
-            // early. Mura/Masa comment out whole `<cftry>/<cfcatch>` blocks that
-            // themselves contain `<!--- … --->` notes; a non-nesting scan ended
-            // the comment at the inner `--->` and left the tail (`</cftry>` etc.)
-            // as stray active code, corrupting the surrounding cflock/brace
-            // structure ("Expected RParen, found __lock_e").
-            let mut j = i + 5;
-            let mut depth = 1usize;
-            while j < len {
-                if j + 4 < len
-                    && chars[j] == '<'
-                    && chars[j + 1] == '!'
-                    && chars[j + 2] == '-'
-                    && chars[j + 3] == '-'
-                    && chars[j + 4] == '-'
-                {
-                    depth += 1;
-                    j += 5;
-                    continue;
-                }
-                if j + 2 < len && chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
-                    depth -= 1;
-                    j += 3;
-                    if depth == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                j += 1;
-            }
-            if depth > 0 {
-                j = len; // unclosed comment, skip to end
-            }
+        if is_cfml_comment_open(&chars, i, len) {
+            // CFML comments NEST (unlike HTML): `<!--- a <!--- b ---> c --->` is
+            // a SINGLE comment — see `cfml_comment_end`. Mura/Masa comment out
+            // whole `<cftry>/<cfcatch>` blocks that themselves contain
+            // `<!--- … --->` notes; a non-nesting scan ended the comment at the
+            // inner `--->` and left the tail (`</cftry>` etc.) as stray active
+            // code, corrupting the surrounding cflock/brace structure
+            // ("Expected RParen, found __lock_e"). An unclosed comment runs to
+            // the end of the source.
+            let j = cfml_comment_end(&chars, i, len).unwrap_or(len);
             // Preserve the newlines that lived inside the comment so downstream
             // line numbers still line up with the source. Dropping the comment
             // outright (a multi-line `<!----- … ----->` banner is common) shifted
@@ -626,7 +600,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
 
     // Check for body (closing </prefix:tagname>)
     let full_tag = format!("{}:{}", prefix, tag_name);
-    if let Some(body_start) = find_closing_tag(chars, tag_end, len, &full_tag) {
+    if let Some(body_start) = find_closing_tag(chars, tag_end, len, &full_tag, in_cfoutput) {
         let body_chars = &chars[tag_end..body_start];
         let body_source: String = body_chars.iter().collect();
         let body_script = tags_to_script_inner(&body_source, imports, in_cfoutput);
@@ -781,7 +755,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // content is always output (even when enableCFOutputOnly is active).
             // Process body recursively with in_cfoutput=true so text uses writeOutput.
             let (body, consumed) = if let Some(end_tag_pos) =
-                find_closing_tag(chars, tag_end, len, "cfoutput")
+                find_closing_tag(chars, tag_end, len, "cfoutput", in_cfoutput)
             {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
@@ -909,7 +883,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if is_query_row_loop {
                 let query = strip_hashes(attrs.get("query").unwrap());
                 let (body, consumed) = if let Some(end_tag_pos) =
-                    find_closing_tag(chars, tag_end, len, "cfloop")
+                    find_closing_tag(chars, tag_end, len, "cfloop", in_cfoutput)
                 {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
@@ -1020,7 +994,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cfscript" => {
             // Everything between <cfscript> and </cfscript> is raw script
             // Find the closing </cfscript>
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfscript") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfscript", in_cfoutput) {
                 let script: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 (script, close_end - start)
@@ -1093,7 +1067,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") || v == "1"
             });
             if output_true {
-                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cffunction") {
+                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cffunction", true) {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
                     let body_script = tags_to_script_inner(&body, imports, true);
@@ -1497,7 +1471,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 opts.push(format!("{}: {}", key, format_attr_value(v, quoted.contains(key))));
             }
 
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 // Runtime body assembly when the body contains control-flow
@@ -1544,7 +1518,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfquery" => {
             // Everything between <cfquery> and </cfquery> is the SQL
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfquery") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfquery", in_cfoutput) {
                 let sql_raw: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
 
@@ -1826,7 +1800,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // `<cfif>`/`<cfloop>` is seen, exactly as the script form does.
             let (params_arg, body_script, consumed) = if is_self_closing_tag(chars, tag_end) {
                 (String::new(), String::new(), tag_end - start)
-            } else if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfzip") {
+            } else if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfzip", in_cfoutput) {
                 let body: String = chars[tag_end..close_pos].iter().collect();
                 let close_end = find_tag_end(chars, close_pos, len);
                 (
@@ -1877,7 +1851,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // (GH #493 audit).
             let variable = attrs.get("variable").cloned().unwrap_or("var __savecontent_result".to_string());
             // Find closing tag — body between is processed by main loop
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsavecontent") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsavecontent", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 // Process body preserving the enclosing cfoutput context. When the
@@ -1910,7 +1884,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 opts.push(format!("\"{}\": \"{}\"", k.replace('"', ""), v.replace('"', "\"\"")));
             }
             let call = format!("markdown(__cfsavecontent_end(), {{ {} }})", opts.join(", "));
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmarkdown") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmarkdown", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
@@ -1938,7 +1912,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 }
                 _ => {
                     // "begin" (default) — wraps body in try/catch
-                    if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cftransaction") {
+                    if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cftransaction", in_cfoutput) {
                         let body: String = chars[tag_end..end_tag_pos].iter().collect();
                         let close_end = find_tag_end(chars, end_tag_pos, len);
                         let body_script = tags_to_script_impl(&body, imports);
@@ -2000,7 +1974,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cfswitch" => {
             let expression = attrs.get("expression").cloned().unwrap_or_default();
             let expression = strip_hashes(&expression);
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfswitch") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfswitch", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let switch_body = parse_cfswitch_body(&body, imports, in_cfoutput);
@@ -2076,7 +2050,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 .map(|v| v.to_lowercase() == "true" || v.to_lowercase() == "yes")
                 .unwrap_or(false);
             if suppress_ws {
-                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective") {
+                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective", in_cfoutput) {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
                     // Preserve the enclosing cfoutput context so `#expr#` in the
@@ -2092,7 +2066,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 }
             } else {
                 // suppressWhiteSpace=false or just pageEncoding — pass through body
-                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective") {
+                if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfprocessingdirective", in_cfoutput) {
                     let body: String = chars[tag_end..end_tag_pos].iter().collect();
                     let close_end = find_tag_end(chars, end_tag_pos, len);
                     let body_script = tags_to_script_inner(&body, imports, in_cfoutput);
@@ -2147,7 +2121,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("__cfsetting({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
         "cfsilent" => {
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsilent") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsilent", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_script = tags_to_script_impl(&body, imports);
@@ -2161,7 +2135,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // Static initialization block (tag form). Convert the body's tags to
             // script and wrap it in a `static { ... }` block, which the parser
             // collects into the component's static_body.
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfstatic") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfstatic", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_script = tags_to_script_impl(&body, imports);
@@ -2243,7 +2217,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             }
         }
         "cflock" => {
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cflock") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cflock", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_script = tags_to_script_impl(&body, imports);
@@ -2302,9 +2276,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let mut child_parts: Vec<String> = Vec::new();
             let mut consumed = tag_end - start;
             if !is_self_closing_tag(chars, tag_end) {
-                if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfinvoke") {
+                if let Some(close_pos) = find_closing_tag(chars, tag_end, len, "cfinvoke", in_cfoutput) {
                     let mut i = tag_end;
                     while i < close_pos {
+                        // A commented-out <cfinvokeargument> passes nothing.
+                        if let Some(end) = skip_cfml_comment(chars, i, len) {
+                            i = end;
+                            continue;
+                        }
                         if chars[i] == '<' {
                             let rem: String =
                                 chars[i..].iter().take(17).collect::<String>().to_lowercase();
@@ -2329,6 +2308,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                                     child_parts.push(format!("\"{}\": {}", key, val));
                                 }
                                 i = cend;
+                                continue;
+                            }
+                            if is_cf_tag_start(chars, i, len) {
+                                i = cf_tag_end_for_scan(chars, i, len);
                                 continue;
                             }
                         }
@@ -2420,7 +2403,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
             // Check for body (closing </cfmodule>)
             let tag_name_full = "cfmodule";
-            if let Some(body_start) = find_closing_tag(chars, tag_end, len, tag_name_full) {
+            if let Some(body_start) = find_closing_tag(chars, tag_end, len, tag_name_full, in_cfoutput) {
                 // Body tag: emit start, recursively preprocess body, then end marker
                 let body_chars = &chars[tag_end..body_start];
                 let body_source: String = body_chars.iter().collect();
@@ -2471,7 +2454,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             }
 
             // Check for body (stdin input)
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfexecute") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfexecute", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_trimmed = body.trim();
@@ -2513,7 +2496,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 opts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
 
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmail") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmail", true) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
 
@@ -2574,7 +2557,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // Runtime cfmail body. Capture the part's own body via a nested
             // savecontent and append the parts list.
             let attrs_lit = cfmailpart_attrs_only_literal(&attrs);
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmailpart") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmailpart", true) {
                 let body_chars = &chars[tag_end..end_tag_pos];
                 let body_source: String = body_chars.iter().collect();
                 let body_script = tags_to_script_inner(&body_source, imports, true);
@@ -2596,7 +2579,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let procedure = attrs.get("procedure").cloned().unwrap_or_default();
             let datasource = attrs.get("datasource").cloned();
 
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfstoredproc") {
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfstoredproc", in_cfoutput) {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
 
@@ -2678,7 +2661,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
             match action.as_str() {
                 "run" => {
-                    if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfthread") {
+                    if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfthread", in_cfoutput) {
                         let body: String = chars[tag_end..end_tag_pos].iter().collect();
                         let close_end = find_tag_end(chars, end_tag_pos, len);
                         let body_script = tags_to_script_impl(&body, imports);
@@ -2815,7 +2798,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             } else {
                 "__cfhtmlbody"
             };
-            if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_lower) {
+            if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_lower, in_cfoutput) {
                 let body_text: String = chars[tag_end..body_start].iter().collect();
                 let close_end = find_tag_end(chars, body_start, len);
                 (
@@ -2853,7 +2836,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
 
                 // Check for body (closing </cf_tagname>)
                 let tag_name_full = format!("cf_{}", custom_tag_name);
-                if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_name_full) {
+                if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_name_full, in_cfoutput) {
                     let body_chars = &chars[tag_end..body_start];
                     let body_source: String = body_chars.iter().collect();
                     // `_inner` with the CALLER's flag, not `_impl` (which restarts
@@ -3549,14 +3532,152 @@ fn strip_hashes(s: &str) -> String {
     result
 }
 
-fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) -> Option<usize> {
+/// Does a CFML comment (`<!---`) open at `i`?
+fn is_cfml_comment_open(chars: &[char], i: usize, len: usize) -> bool {
+    i + 4 < len
+        && chars[i] == '<'
+        && chars[i + 1] == '!'
+        && chars[i + 2] == '-'
+        && chars[i + 3] == '-'
+        && chars[i + 4] == '-'
+}
+
+/// The index just past the end of the CFML comment that opens at `i`, or
+/// `None` if it never closes. Comments nest: in `<!--- a <!--- b ---> c --->`
+/// the first `--->` closes only the inner one. The converter strips comments
+/// with this as it reads text, and the look-ahead scanners step over the same
+/// spans with it (see [`skip_cfml_comment`]).
+fn cfml_comment_end(chars: &[char], i: usize, len: usize) -> Option<usize> {
+    let mut j = i + 5;
+    let mut depth = 1usize;
+    while j < len {
+        if is_cfml_comment_open(chars, j, len) {
+            depth += 1;
+            j += 5;
+            continue;
+        }
+        if j + 2 < len && chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
+            depth -= 1;
+            j += 3;
+            if depth == 0 {
+                return Some(j);
+            }
+            continue;
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Where a look-ahead scanner resumes after a CFML comment at `i`: `None` when
+/// no comment opens there, or when it never closes.
+///
+/// The scanners work out a tag's structure (its closing tag, its cfcase
+/// branches, its cfargument list) before the converter reads the body, and the
+/// converter strips every comment it meets in text. A tag written inside a
+/// comment is therefore not part of that structure, as on Lucee. The scanners
+/// call this only where the converter would meet text: they step over CF
+/// tags, `<cfscript>` blocks and, inside cfoutput, `#…#` expressions
+/// themselves, because a `<!---` in those is data (`replace(s, "<!---", "")`).
+///
+/// An unclosed `<!---` is still not skipped. The converter would strip to the
+/// end of the source, but a scan meets one only where it reads data as text
+/// (the attributes of a cfimport-prefixed tag, say), and text is how the
+/// scanners have always read it.
+fn skip_cfml_comment(chars: &[char], i: usize, len: usize) -> Option<usize> {
+    if is_cfml_comment_open(chars, i, len) {
+        cfml_comment_end(chars, i, len)
+    } else {
+        None
+    }
+}
+
+/// Is the tag name `name` (`<cfoutput`, `</cfscript`, …) at `i`, ignoring
+/// case, and not just the start of a longer name?
+fn tag_at(chars: &[char], i: usize, len: usize, name: &str) -> bool {
+    let n = name.len();
+    if i + n > len || !name.chars().zip(&chars[i..i + n]).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+        return false;
+    }
+    match chars.get(i + n) {
+        None => true,
+        Some(c) => c.is_whitespace() || *c == '>' || *c == '/',
+    }
+}
+
+/// Where a look-ahead scan resumes after the CF tag at `i`: past its `>`, the
+/// tag read as one unit the way `parse_cf_tag` reads it (quoted attributes,
+/// expressions and all), and past the matching `</cfscript>` when it opens a
+/// `<cfscript>` block, whose body the converter reads as raw script.
+fn cf_tag_end_for_scan(chars: &[char], i: usize, len: usize) -> usize {
+    let end = find_tag_end(chars, i + 1, len);
+    if tag_at(chars, i, len, "<cfscript") && !is_self_closing_tag(chars, end) {
+        if let Some(close) = find_closing_tag(chars, end, len, "cfscript", false) {
+            return find_tag_end(chars, close + 1, len);
+        }
+    }
+    end
+}
+
+/// Inside cfoutput, where a look-ahead scan resumes after the `#…#`
+/// expression (or `##` escape) that starts at `i`, read as the converter
+/// reads it. `None` when the `#` opens no expression, and when the span would
+/// run over `guard`, the tag the scan is looking for: a lone `#` must not
+/// swallow it, so such a `#` stays text as it always was.
+fn hash_expression_end(chars: &[char], i: usize, len: usize, guard: &[char]) -> Option<usize> {
+    if chars.get(i + 1) == Some(&'#') {
+        return Some(i + 2);
+    }
+    let end = find_closing_hash(chars, i + 1, len)?;
+    let span = &chars[i + 1..end];
+    let swallows_guard = !guard.is_empty()
+        && span.len() >= guard.len()
+        && span
+            .windows(guard.len())
+            .any(|w| w.iter().zip(guard).all(|(a, b)| a.eq_ignore_ascii_case(b)));
+    if swallows_guard {
+        None
+    } else {
+        Some(end + 1)
+    }
+}
+
+/// The start of the closing tag that matches the body tag `tag_name` whose
+/// body starts at `start`. `in_cfoutput` says whether `#…#` in the body is an
+/// expression: the cfoutput context the tag sits in, or `true` for a tag whose
+/// body the converter reads as output (cffunction, cfmail).
+///
+/// The body is read the way the converter will read it, so that a tag written
+/// inside a CFML comment does not count: a comment found in text is skipped
+/// whole (see [`skip_cfml_comment`]), while the inside of a CF tag, a
+/// `<cfscript>` block and a `#…#` expression are not text, and a `<!---`
+/// there is data. A `<cfscript>` body itself is scanned raw.
+fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str, in_cfoutput: bool) -> Option<usize> {
     let close_target = format!("</{}", tag_name);
     let close_lower = close_target.to_lowercase();
     let open_target = format!("<{}", tag_name);
     let open_lower = open_target.to_lowercase();
+    let as_converter = !tag_name.eq_ignore_ascii_case("cfscript");
+    // `#…#` is an expression in cfoutput: the target's own body when it is a
+    // cfoutput, or a cfoutput opened inside the body.
+    let hash_context = in_cfoutput || tag_name.eq_ignore_ascii_case("cfoutput");
+    let close_chars: Vec<char> = close_target.chars().collect();
+    let mut outputs = 0usize;
     let mut depth = 0;
     let mut i = start;
     while i < len {
+        if as_converter {
+            if chars[i] == '#' && (hash_context || outputs > 0) {
+                if let Some(end) = hash_expression_end(chars, i, len, &close_chars) {
+                    i = end;
+                    continue;
+                }
+            }
+            if let Some(end) = skip_cfml_comment(chars, i, len) {
+                i = end;
+                continue;
+            }
+        }
         if chars[i] == '<' {
             if chars.get(i + 1) == Some(&'/') {
                 // Potential closing tag
@@ -3580,6 +3701,15 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
                         depth += 1;
                     }
                 }
+            }
+            if as_converter && is_cf_tag_start(chars, i, len) {
+                if tag_at(chars, i, len, "<cfoutput") {
+                    outputs += 1;
+                } else if tag_at(chars, i, len, "</cfoutput") {
+                    outputs = outputs.saturating_sub(1);
+                }
+                i = cf_tag_end_for_scan(chars, i, len);
+                continue;
             }
         }
         i += 1;
@@ -3609,6 +3739,13 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
         // Skip whitespace
         while i < len && chars[i].is_whitespace() {
             i += 1;
+        }
+        // A commented-out <cfargument> declares nothing, and a comment that
+        // mentions another tag (`<cfset>`, `<cfreturn>`…) must not end the scan
+        // before the real arguments that follow it.
+        if let Some(end) = skip_cfml_comment(chars, i, len) {
+            i = end;
+            continue;
         }
         // Check if we hit a <cfargument. The tag name must be followed by a
         // word boundary — ANY whitespace (space, newline, tab) or `>` — not just
@@ -3676,13 +3813,10 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
                     }
                     names.push(decl);
                 }
-                // Skip to end of tag
-                while i < len && chars[i] != '>' {
-                    i += 1;
-                }
-                if i < len {
-                    i += 1;
-                }
+                // Skip to the end of the tag, read as one unit so that a `>`
+                // or `<!---` inside an attribute value is not mistaken for
+                // the tag's end or a comment.
+                i = find_tag_end(chars, i + 1, len);
                 continue;
             }
             // If we hit any other CF tag (like <cfreturn>, <cfset>, etc.) or closing </cffunction>, stop scanning
@@ -3694,6 +3828,11 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
                 || next_lower.starts_with("<cftry")
             {
                 break;
+            }
+            // Any other CF tag: step over it whole, as the converter reads it.
+            if is_cf_tag_start(chars, i, len) {
+                i = cf_tag_end_for_scan(chars, i, len);
+                continue;
             }
         }
         i += 1;
@@ -3722,10 +3861,24 @@ fn group_case_sensitive(attrs: &std::collections::HashMap<String, String>) -> bo
 /// Index of the opening `<` of the first `<cfoutput ...>`/`<cfloop ...>`
 /// (word-bounded) at or after `from`. Locates the nested detail block inside a
 /// grouped `<cfoutput query group=>` / `<cfloop query group=>`.
-fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str) -> Option<usize> {
+fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str, in_cfoutput: bool) -> Option<usize> {
     let needle: Vec<char> = tag.chars().collect();
+    let guard: Vec<char> = std::iter::once('<').chain(tag.chars()).collect();
+    let mut outputs = 0usize;
     let mut i = from;
     while i < len {
+        // Read the body as the converter will (see `find_closing_tag`), so a
+        // `<cfoutput>` written inside a comment is not the detail block.
+        if chars[i] == '#' && (in_cfoutput || outputs > 0) {
+            if let Some(end) = hash_expression_end(chars, i, len, &guard) {
+                i = end;
+                continue;
+            }
+        }
+        if let Some(end) = skip_cfml_comment(chars, i, len) {
+            i = end;
+            continue;
+        }
         if chars[i] == '<' {
             let name_start = i + 1;
             if name_start + needle.len() <= len
@@ -3739,6 +3892,15 @@ fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str) -> Option
                 if boundary {
                     return Some(i);
                 }
+            }
+            if is_cf_tag_start(chars, i, len) {
+                if tag_at(chars, i, len, "<cfoutput") {
+                    outputs += 1;
+                } else if tag_at(chars, i, len, "</cfoutput") {
+                    outputs = outputs.saturating_sub(1);
+                }
+                i = cf_tag_end_for_scan(chars, i, len);
+                continue;
             }
         }
         i += 1;
@@ -3780,7 +3942,7 @@ fn emit_grouped_query_body(
     let detail_open = {
         let mut at = 0;
         loop {
-            match find_nested_tag(&chars, at, len, inner_tag) {
+            match find_nested_tag(&chars, at, len, inner_tag, in_cfoutput) {
                 None => break None,
                 Some(open) => {
                     let name_end = open + 1 + inner_tag.len();
@@ -3800,7 +3962,7 @@ fn emit_grouped_query_body(
         let name_end = open + 1 + inner_tag.len();
         let (attrs, _quoted, tag_end) = parse_tag_attributes(&chars, name_end, len);
         let pre: String = chars[..open].iter().collect();
-        if let Some(close) = find_closing_tag(&chars, tag_end, len, inner_tag) {
+        if let Some(close) = find_closing_tag(&chars, tag_end, len, inner_tag, in_cfoutput) {
             let inner: String = chars[tag_end..close].iter().collect();
             let close_end = find_tag_end(&chars, close, len);
             let post: String = chars[close_end..].iter().collect();
@@ -4186,6 +4348,12 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
         }
         if i >= len { break; }
 
+        // A commented-out <cfcase> is not a branch.
+        if let Some(end) = skip_cfml_comment(&chars, i, len) {
+            i = end;
+            continue;
+        }
+
         // Look for <cfcase or <cfdefaultcase
         if chars[i] == '<' {
             let ahead: String = chars[i..std::cmp::min(i + 16, len)].iter().collect();
@@ -4198,7 +4366,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 while j < len && chars[j].is_alphanumeric() { j += 1; }
                 let (_attrs, _, tag_end) = parse_tag_attributes(&chars, j, len);
                 // Find closing </cfdefaultcase>
-                if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfdefaultcase") {
+                if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfdefaultcase", in_cfoutput) {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
                     let case_script = tags_to_script_inner(&case_body, imports, in_cfoutput);
                     result.push_str(&format!("default: \n{}", case_script));
@@ -4215,7 +4383,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 let (case_attrs, _, tag_end) = parse_tag_attributes(&chars, j, len);
                 let value = case_attrs.get("value").cloned().unwrap_or_default();
                 // Find closing </cfcase>
-                if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfcase") {
+                if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfcase", in_cfoutput) {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
                     let case_script = tags_to_script_inner(&case_body, imports, in_cfoutput);
                     // Value can be comma-separated for multiple case values.
@@ -4248,6 +4416,9 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 } else {
                     i += 1;
                 }
+            } else if is_cf_tag_start(&chars, i, len) {
+                // Any other CF tag: step over it whole, as the converter reads it.
+                i = cf_tag_end_for_scan(&chars, i, len);
             } else {
                 i += 1;
             }
